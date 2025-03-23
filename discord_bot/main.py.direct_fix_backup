@@ -1,0 +1,211 @@
+import discord
+from discord.ext import commands
+import os
+import json
+import logging
+from datetime import datetime
+import random
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("discord_bot")
+
+# Load configuration
+try:
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    logger.error("Config file not found. Please create a config.json file.")
+    exit(1)
+
+# Initialize bot with intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix=config['prefix'], intents=intents, help_command=None)
+
+# Event: Bot is ready
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user.name} has connected to Discord!')
+    # Set start time for uptime tracking
+    bot.start_time = datetime.utcnow()
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.listening, 
+        name=f"{config['prefix']}help"
+    ))
+    
+    # Load cogs
+    for filename in os.listdir('./cogs'):
+        if filename.endswith('.py'):
+            try:
+                await bot.load_extension(f'cogs.{filename[:-3]}')
+                logger.info(f'Loaded extension: {filename}')
+            except Exception as e:
+                logger.error(f'Failed to load extension {filename}: {e}')
+
+# Event: Message received
+@bot.event
+async def on_message(message):
+    # Don't respond to bot messages
+    if message.author.bot:
+        return
+    
+    # IMPORTANT: Special handling for !help command to avoid duplicates
+    if message.content.strip().lower() in [f"{config['prefix']}help", f"{config['prefix']}help "]:
+        # Only process our custom help command
+        ctx = await bot.get_context(message)
+        if ctx.valid:
+            await help(ctx)
+        return  # Don't process this message any further
+    
+    # Process commands
+    await bot.process_commands(message)
+    
+    # If not a command, process as a conversation (to be implemented in conversation cog)
+
+# Simple ping command to check latency
+@bot.command(name="ping", help="Check the bot's response time")
+async def ping(ctx):
+    # Calculate latency
+    latency = round(bot.latency * 1000)
+    
+    # Determine response based on latency
+    if latency < 50:
+        quality = "Lightning fast"
+        emoji = "⚡"
+        color = discord.Color.green()
+    elif latency < 100:
+        quality = "Very good"
+        emoji = "🚀"
+        color = discord.Color.blue()
+    elif latency < 200:
+        quality = "Good"
+        emoji = "👍"
+        color = discord.Color.gold()
+    elif latency < 400:
+        quality = "Acceptable"
+        emoji = "🙂"
+        color = discord.Color.orange()
+    else:
+        quality = "Slow"
+        emoji = "🐢"
+        color = discord.Color.red()
+    
+    # Create a fun response
+    responses = [
+        f"Pong! {emoji}",
+        f"I'm here! {emoji}",
+        f"At your service! {emoji}",
+        f"Ready to help! {emoji}",
+        f"Hello there! {emoji}"
+    ]
+    
+    # Create an embed for richer display
+    embed = discord.Embed(
+        title=random.choice(responses),
+        description=f"Response time: **{latency}ms** ({quality})",
+        color=color,
+        timestamp=datetime.utcnow()
+    )
+    
+    # Add uptime if we have it
+    if hasattr(bot, 'start_time'):
+        uptime = datetime.utcnow() - bot.start_time
+        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        days, hours = divmod(hours, 24)
+        
+        if days:
+            uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+        elif hours:
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes:
+            uptime_str = f"{minutes}m {seconds}s"
+        else:
+            uptime_str = f"{seconds}s"
+            
+        embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    
+    # Add server count
+    embed.add_field(name="Serving", value=f"{len(bot.guilds)} servers", inline=True)
+    
+    # Add a footer
+    tips = [
+        "Try !help to see all commands!",
+        "Use !profile to customize your experience!",
+        "Need a productivity boost? Try !pomodoro!",
+        "Stay organized with !todo",
+        "Need inspiration? Try !quote"
+    ]
+    embed.set_footer(text=random.choice(tips))
+    
+    # Send the response
+    await ctx.send(embed=embed)
+
+# Simple help command using the standard decorator
+@bot.command(name="help")
+async def help(ctx, command: str = None):
+    """Display help for Aarohi's commands"""
+    if command is None:
+        # Display ONLY the minimal help message exactly as specified
+        embed = discord.Embed(
+            title="Aarohi Commands",
+            description="Hey! I'm Aarohi, here to help you stay productive and have some fun.",
+            color=discord.Color.purple()
+        )
+
+        # Basic Commands
+        embed.add_field(
+            name="📌 Basic Commands",
+            value=(
+                "`!ping` - Check if I'm online\n"
+                "`!help` - Display this help message"
+            ),
+            inline=False
+        )
+
+        # Productivity Tools
+        embed.add_field(
+            name="⏱️ Productivity Tools",
+            value=(
+                "`!pomodoro` - Start a focus session\n"
+                "`!todo` - Manage your to-do list\n"
+                "`!alarm` - Set or view alarms\n"
+                "`!focus` - Enter distraction-free mode"
+            ),
+            inline=False
+        )
+
+        # Personalization
+        embed.add_field(
+            name="✨ Personalization",
+            value=(
+                "`!profile` - View or update your profile\n"
+                "`!mood` - Track your emotional state\n"
+                "`!resources` - Get helpful resources\n"
+                "`!quote` - Get an inspirational quote"
+            ),
+            inline=False
+        )
+
+        # Footer
+        embed.set_footer(text="Type !help <command> for more details")
+
+        # Send ONLY this embed, nothing else
+        await ctx.send(embed=embed)
+        return
+    else:
+        # Command-specific help
+        await ctx.send(f"I don't have specific help for `{command}`. Try `!help` to see all available commands.")
+
+# Run the bot
+if __name__ == "__main__":
+    bot.run(config['token'], log_handler=None) 

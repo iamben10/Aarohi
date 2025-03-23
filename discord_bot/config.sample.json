@@ -1,0 +1,7 @@
+{
+    "token": "YOUR_DISCORD_BOT_TOKEN",
+    "prefix": "!",
+    "owner_id": "YOUR_DISCORD_USER_ID",
+    "activity_status": "!help",
+    "default_conversation_cooldown": 1
+} 

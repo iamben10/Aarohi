@@ -1,0 +1,6 @@
+{
+    "conversation_cooldown": 1,
+    "respond_chance": 10,
+    "dm_respond_chance": 100,
+    "mention_respond_chance": 100
+}
