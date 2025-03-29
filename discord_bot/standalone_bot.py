@@ -11,6 +11,16 @@ import pytz
 import pickle
 import re
 from typing import Dict, List, Tuple, Optional, Union
+from flask import Flask
+from threading import Thread
+from keep_alive import keep_alive
+from training_pipeline import TrainingPipeline
+import traceback
+import sys
+from robust_commands import inject_robust_command_handling
+
+# Define allowed channel ID (GLOBAL CONSTANT)
+ALLOWED_CHANNEL_ID = 1353429400460198032  # The specific channel where Aarohi should respond
 
 # Configure logging
 logging.basicConfig(
@@ -28,30 +38,35 @@ print("AAROHI BOT - CLEAN COMMAND SYSTEM")
 print("=" * 60)
 print("\nThis version of Aarohi has a completely overhauled command system.")
 print("All commands work independently and produce clean output.\n")
+print(f"BOT RESTRICTED TO CHANNEL ID: {ALLOWED_CHANNEL_ID}")
 
-# Load configuration
-try:
-    with open('config.json', 'r') as f:
-        config = json.load(f)
-        PREFIX = config['prefix']
-        TOKEN = config['token']
-    print(f"✅ Loaded configuration with prefix: {PREFIX}")
-except FileNotFoundError:
-    print("❌ Config file not found. Creating a default one...")
-    PREFIX = "!"
-    TOKEN = input("Please enter your bot token: ")
-    config = {"prefix": PREFIX, "token": TOKEN}
-    with open('config.json', 'w') as f:
-        json.dump(config, f, indent=4)
-    print("✅ Created default config.json")
+# Initialize training pipeline
+training_pipeline = TrainingPipeline()
 
 # Initialize bot with intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+try:
+    # Try to load config
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+    prefix = config.get('prefix', '!')  # Use '!' as fallback
+except:
+    # If config loading fails, use default prefix
+    prefix = '!'
+    print("Warning: Couldn't load config.json, using default prefix '!'")
+
 # Create bot with COMPLETELY DISABLED help command (we'll implement our own)
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=prefix, intents=intents, help_command=None)
+# Inject bulletproof command handling
+error_handler = inject_robust_command_handling(bot)
+logger.info("Bulletproof command handling activated")
+
+
+# Print confirmation of prefix
+print(f"Bot initialized with command prefix: '{prefix}'")
 
 # Global storage for scheduled alarms - persistent across restarts
 # Format: {user_id: [(channel_id, datetime_obj, message), ...]}
@@ -650,7 +665,7 @@ async def on_ready():
     bot.start_time = datetime.utcnow()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening, 
-        name=f"{PREFIX}help"
+        name=f"!help"
     ))
     
     # Load saved user timezones
@@ -684,32 +699,82 @@ async def on_ready():
         print("❌ No cogs directory found")
     
     print(f"\nBot is fully ready!")
-    print(f"Type {PREFIX}help in Discord to see the clean commands list!")
+    print(f"Type !help in Discord to see the clean commands list!")
+    
+    # Start monitoring chat folder in background
+    asyncio.create_task(monitor_chat_folder())
 
-# Event: Message received - for timezone detection
+async def monitor_chat_folder():
+    """Monitor chat folder in background"""
+    while True:
+        try:
+            training_pipeline.monitor_chat_folder('chat_exports')
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Error monitoring chat folder: {e}")
+            await asyncio.sleep(5)
+
+@bot.command(name='teach')
+async def teach(ctx, *, content: str):
+    """Teach the bot a new response pattern"""
+    try:
+        # Parse the teaching command
+        # Format: !teach If someone says 'input' then reply 'output'
+        parts = content.split("'")
+        if len(parts) != 4:
+            await ctx.send("Please use the format: !teach If someone says 'input' then reply 'output'")
+            return
+            
+        input_text = parts[1]
+        output_text = parts[3]
+        
+        # Add to training pipeline
+        training_pipeline.add_training_pair(input_text, output_text)
+        
+        await ctx.send("I've learned that! I'll remember to respond that way.")
+        
+    except Exception as e:
+        await ctx.send(f"Sorry, I couldn't understand that teaching format. Please try again.")
+        print(f"Error in teach command: {e}")
+
+@bot.command(name='stats')
+async def stats(ctx):
+    """Show training statistics"""
+    try:
+        stats = training_pipeline.get_training_stats()
+        embed = discord.Embed(title="Aarohi's Training Statistics", color=discord.Color.blue())
+        embed.add_field(name="Total Training Pairs", value=stats["total_training_pairs"])
+        embed.add_field(name="Emotion Types Covered", value=stats["emotion_types_covered"])
+        embed.add_field(name="Last Updated", value=stats["last_updated"])
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send("Sorry, I couldn't retrieve my training statistics right now.")
+        print(f"Error in stats command: {e}")
+
 @bot.event
 async def on_message(message):
-    # Don't respond to bot messages
-    if message.author.bot:
+    # Don't respond to our own messages
+    if message.author == bot.user:
+        return
+        
+    # Ignore messages from all other channels
+    if message.channel.id != ALLOWED_CHANNEL_ID:
         return
     
-    # Check if it's potentially an introduction message and the user doesn't have a timezone set
-    user_id = message.author.id
-    if (user_id not in user_timezones and 
-        len(message.content) > 20 and 
-        ("introduce" in message.content.lower() or 
-         "hello" in message.content.lower() or 
-         "hi" in message.content.lower() or 
-         "from" in message.content.lower())):
-        
-        timezone = await detect_timezone_from_intro(message.content)
-        if timezone:
-            user_timezones[user_id] = timezone
-            save_timezones()
-            logger.info(f"Automatically detected timezone {timezone} for user {user_id}")
-    
-    # Process commands
+    # Process commands FIRST - this must be called for all messages
     await bot.process_commands(message)
+
+    # Only continue for non-command messages
+    # Skip if message is a command, DM, or from a bot
+    if message.content.startswith(prefix) or message.guild is None or message.author.bot:
+        return
+
+    # Get response from training pipeline
+    response, confidence = training_pipeline.find_response(message.content)
+
+    # Only respond if confidence is high enough
+    if confidence > 0.5:
+        await message.channel.send(response)
 
 # Custom help command - exactly matching the required format
 @bot.command(name="help")
@@ -731,9 +796,9 @@ async def help_command(ctx, command: str = None):
     embed.add_field(
         name="📌 Basic Commands",
         value=(
-            f"`{PREFIX}ping` - Check if I'm online\n"
-            f"`{PREFIX}help` - Display this help message\n"
-            f"`{PREFIX}guide <command>` - Detailed help for a specific command"
+            f"`!ping` - Check if I'm online\n"
+            f"`!help` - Display this help message\n"
+            f"`!guide <command>` - Detailed help for a specific command"
         ),
         inline=False
     )
@@ -742,13 +807,13 @@ async def help_command(ctx, command: str = None):
     embed.add_field(
         name="📝 Productivity",
         value=(
-            f"`{PREFIX}todo` - Manage your to-do list\n"
-            f"`{PREFIX}alarm HH:MM message` - Set an alarm\n"
-            f"`{PREFIX}alarm cancel #ID` - Cancel a specific alarm\n"
-            f"`{PREFIX}settimezone timezone` - Set your timezone\n"
-            f"`{PREFIX}pomodoro <minutes>` - Start a Pomodoro timer\n"
-            f"`{PREFIX}pomodoro cancel` - Cancel active Pomodoro\n"
-            f"`{PREFIX}focus min` - Set a focus time"
+            f"`!todo` - Manage your to-do list\n"
+            f"`!alarm HH:MM message` - Set an alarm\n"
+            f"`!alarm cancel #ID` - Cancel a specific alarm\n"
+            f"`!settimezone timezone` - Set your timezone\n"
+            f"`!pomodoro <minutes>` - Start a Pomodoro timer\n"
+            f"`!pomodoro cancel` - Cancel active Pomodoro\n"
+            f"`!focus min` - Set a focus time"
         ),
         inline=False
     )
@@ -757,9 +822,9 @@ async def help_command(ctx, command: str = None):
     embed.add_field(
         name="🏆 Points & Competition",
         value=(
-            f"`{PREFIX}points` - View your productivity points\n"
-            f"`{PREFIX}leaderboard` - See the current rankings\n"
-            f"`{PREFIX}setsound` - Customize your notification sounds\n"
+            f"`!points` - View your productivity points\n"
+            f"`!leaderboard` - See the current rankings\n"
+            f"`!setsound` - Customize your notification sounds\n"
             f"Daily leaderboard posted at 11:00 PM"
         ),
         inline=False
@@ -769,16 +834,16 @@ async def help_command(ctx, command: str = None):
     embed.add_field(
         name="✨ Personalization",
         value=(
-            f"`{PREFIX}profile` - View your profile\n"
-            f"`{PREFIX}mood <emotion>` - Track your mood\n"
-            f"`{PREFIX}resources` - Get helpful resources\n"
-            f"`{PREFIX}quote` - Get an inspirational quote"
+            f"`!profile` - View your profile\n"
+            f"`!mood <emotion>` - Track your mood\n"
+            f"`!resources` - Get helpful resources\n"
+            f"`!quote` - Get an inspirational quote"
         ),
         inline=False
     )
     
     # Footer
-    embed.set_footer(text=f"Type {PREFIX}guide <command> for detailed instructions on any command")
+    embed.set_footer(text=f"Type !guide <command> for detailed instructions on any command")
     
     await ctx.send(embed=embed)
 
@@ -884,8 +949,8 @@ async def pomodoro(ctx, *args):
             embed = discord.Embed(
                 title="⚠️ Invalid Pomodoro Command",
                 description=f"I couldn't understand that command. Please use either:\n"
-                           f"• `{PREFIX}pomodoro [minutes]` to start a timer\n"
-                           f"• `{PREFIX}pomodoro cancel` to cancel an active timer",
+                           f"• `!pomodoro [minutes]` to start a timer\n"
+                           f"• `!pomodoro cancel` to cancel an active timer",
                 color=discord.Color.red()
             )
             await ctx.send(embed=embed)
@@ -984,7 +1049,7 @@ async def pomodoro(ctx, *args):
             name="Options",
             value=(
                 f"• Wait for current session to end\n"
-                f"• Type `{PREFIX}pomodoro cancel` to cancel it"
+                f"• Type `!pomodoro cancel` to cancel it"
             ),
             inline=False
         )
@@ -1015,7 +1080,7 @@ async def pomodoro(ctx, *args):
     
     embed.add_field(
         name="Cancel Anytime",
-        value=f"To cancel this session, type `{PREFIX}pomodoro cancel`",
+        value=f"To cancel this session, type `!pomodoro cancel`",
         inline=False
     )
     
@@ -1087,7 +1152,7 @@ async def pomodoro_timer(channel_id: int, user_id: int, minutes: int):
             
             embed.add_field(
                 name="Start Another",
-                value=f"Type `{PREFIX}pomodoro [minutes]` to start a new focus session."
+                value=f"Type `!pomodoro [minutes]` to start a new focus session."
             )
             
             await channel.send(f"<@{user_id}>", embed=embed)
@@ -1138,7 +1203,7 @@ async def todo(ctx, action: str = "list", *, item: str = None):
     elif action.lower() == "clear":
         embed.description = "Your to-do list has been cleared."
     else:
-        embed.description = f"Invalid action. Use `{PREFIX}todo list`, `{PREFIX}todo add <item>`, `{PREFIX}todo remove <item>`, or `{PREFIX}todo clear`"
+        embed.description = f"Invalid action. Use `!todo list`, `!todo add <item>`, `!todo remove <item>`, or `!todo clear`"
     
     # Send a single message
     await ctx.send(embed=embed)
@@ -1183,14 +1248,14 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
             embed.add_field(name="Scheduled Alarms", value="\n".join(alarms_list) or "None")
             embed.add_field(
                 name="Manage Alarms", 
-                value=f"• Set: `{PREFIX}alarm HH:MM [message]`\n• Cancel: `{PREFIX}alarm cancel #ID`\n• Clear all: `{PREFIX}alarm clear`", 
+                value=f"• Set: `!alarm HH:MM [message]`\n• Cancel: `!alarm cancel #ID`\n• Clear all: `!alarm clear`", 
                 inline=False
             )
         else:
             embed.description = "You don't have any alarms set."
             embed.add_field(
                 name="Usage", 
-                value=f"• Set: `{PREFIX}alarm HH:MM [message]`\n• View: `{PREFIX}alarm`\n• Help: `{PREFIX}guide alarm`", 
+                value=f"• Set: `!alarm HH:MM [message]`\n• View: `!alarm`\n• Help: `!guide alarm`", 
                 inline=False
             )
         
@@ -1207,7 +1272,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
             )
             embed.add_field(
                 name="Usage",
-                value=f"• View alarms and IDs: `{PREFIX}alarm`\n• Cancel by ID: `{PREFIX}alarm cancel #ID`\n(Example: `{PREFIX}alarm cancel 1`)"
+                value=f"• View alarms and IDs: `!alarm`\n• Cancel by ID: `!alarm cancel #ID`\n(Example: `!alarm cancel 1`)"
             )
             await ctx.send(embed=embed)
             return
@@ -1223,7 +1288,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
             )
             embed.add_field(
                 name="Usage",
-                value=f"• View alarms and IDs: `{PREFIX}alarm`\n• Cancel by ID: `{PREFIX}alarm cancel #ID`"
+                value=f"• View alarms and IDs: `!alarm`\n• Cancel by ID: `!alarm cancel #ID`"
             )
             await ctx.send(embed=embed)
             return
@@ -1244,7 +1309,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
                 description=f"Alarm #{alarm_id+1} doesn't exist. Please check your alarm list.",
                 color=discord.Color.red()
             )
-            embed.add_field(name="Your Alarms", value=f"To see your alarms, type `{PREFIX}alarm`")
+            embed.add_field(name="Your Alarms", value=f"To see your alarms, type `!alarm`")
             await ctx.send(embed=embed)
             return
         
@@ -1294,7 +1359,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
         if user_id in scheduled_alarms and scheduled_alarms[user_id]:
             embed.add_field(
                 name="Remaining Alarms", 
-                value=f"You have {len(scheduled_alarms[user_id])} active alarm(s).\nView them with `{PREFIX}alarm`", 
+                value=f"You have {len(scheduled_alarms[user_id])} active alarm(s).\nView them with `!alarm`", 
                 inline=False
             )
         
@@ -1339,8 +1404,8 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
         )
         embed.add_field(
             name="Set Timezone",
-            value=f"Please set your timezone by typing `{PREFIX}settimezone [your timezone]`\n"
-                  f"Example: `{PREFIX}settimezone US/Eastern` or `{PREFIX}settimezone IST`"
+            value=f"Please set your timezone by typing `!settimezone [your timezone]`\n"
+                  f"Example: `!settimezone US/Eastern` or `!settimezone IST`"
         )
         await ctx.send(embed=embed)
         return
@@ -1359,7 +1424,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
             description="Please use the 24-hour format `HH:MM` (e.g., `14:30` for 2:30 PM).",
             color=discord.Color.red()
         )
-        embed.add_field(name="Usage", value=f"`{PREFIX}alarm HH:MM [message]` - Set an alarm for the specified time")
+        embed.add_field(name="Usage", value=f"`!alarm HH:MM [message]` - Set an alarm for the specified time")
         await ctx.send(embed=embed)
         return
     
@@ -1416,7 +1481,7 @@ async def alarm(ctx, action_or_time: str = None, alarm_id_or_msg: str = None, *,
     
     embed.add_field(
         name="Manage This Alarm",
-        value=f"To cancel this alarm, type `{PREFIX}alarm cancel {len(scheduled_alarms[user_id])}`",
+        value=f"To cancel this alarm, type `!alarm cancel {len(scheduled_alarms[user_id])}`",
         inline=False
     )
     
@@ -1464,7 +1529,7 @@ async def profile(ctx, user: discord.Member = None):
     if user == ctx.author:
         embed.add_field(
             name="Profile Management", 
-            value=f"You can customize your profile with `{PREFIX}profile set <key> <value>`",
+            value=f"You can customize your profile with `!profile set <key> <value>`",
             inline=False
         )
     
@@ -1478,7 +1543,7 @@ async def mood(ctx, current_mood: str = None):
     if not current_mood:
         embed = discord.Embed(
             title="😊 Mood Tracker",
-            description=f"How are you feeling today? Try `{PREFIX}mood <emotion>`",
+            description=f"How are you feeling today? Try `!mood <emotion>`",
             color=discord.Color.teal()
         )
         embed.add_field(
@@ -1517,7 +1582,7 @@ async def resources(ctx, category: str = None):
         )
         embed.add_field(
             name="Usage",
-            value=f"Type `{PREFIX}resources <category>` to see resources for that category",
+            value=f"Type `!resources <category>` to see resources for that category",
             inline=False
         )
     elif category.lower() == "productivity":
@@ -1584,7 +1649,7 @@ async def resources(ctx, category: str = None):
 async def guide(ctx, command: str = None):
     """Display detailed guide for specific commands"""
     if not command:
-        await ctx.send(f"The guide command has been replaced with `{PREFIX}help`. Showing help menu...")
+        await ctx.send(f"The guide command has been replaced with `!help`. Showing help menu...")
         await help_command(ctx)
         return
     
@@ -1600,8 +1665,8 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Setting Alarms",
             value=(
-                f"• `{PREFIX}alarm HH:MM [message]` - Schedule an alarm\n"
-                f"  Example: `{PREFIX}alarm 14:30 Time for a meeting`\n\n"
+                f"• `!alarm HH:MM [message]` - Schedule an alarm\n"
+                f"  Example: `!alarm 14:30 Time for a meeting`\n\n"
                 f"• Time format is 24-hour (00:00 to 23:59)\n"
                 f"• The message is optional but helpful as a reminder\n"
                 f"• If the time has already passed today, the alarm will be set for tomorrow"
@@ -1613,10 +1678,10 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📋 Managing Alarms",
             value=(
-                f"• `{PREFIX}alarm` - View all your scheduled alarms\n"
-                f"• `{PREFIX}alarm cancel #ID` - Cancel a specific alarm\n"
-                f"  Example: `{PREFIX}alarm cancel 1` cancels alarm #1\n"
-                f"• `{PREFIX}alarm clear` - Cancel all your alarms"
+                f"• `!alarm` - View all your scheduled alarms\n"
+                f"• `!alarm cancel #ID` - Cancel a specific alarm\n"
+                f"  Example: `!alarm cancel 1` cancels alarm #1\n"
+                f"• `!alarm clear` - Cancel all your alarms"
             ),
             inline=False
         )
@@ -1626,8 +1691,8 @@ async def guide(ctx, command: str = None):
             name="🌐 Time Zone Handling",
             value=(
                 f"• Alarms work based on your local time zone\n"
-                f"• Set your time zone with `{PREFIX}settimezone [timezone]`\n"
-                f"  Example: `{PREFIX}settimezone US/Eastern` or `{PREFIX}settimezone IST`\n"
+                f"• Set your time zone with `!settimezone [timezone]`\n"
+                f"  Example: `!settimezone US/Eastern` or `!settimezone IST`\n"
                 f"• Aarohi will auto-detect your time zone from introduction messages when possible\n"
                 f"• Your time zone is required for alarm accuracy"
             ),
@@ -1639,7 +1704,7 @@ async def guide(ctx, command: str = None):
             name="❓ Troubleshooting",
             value=(
                 f"• If your alarm doesn't trigger, make sure your time zone is set correctly\n"
-                f"• View your current alarms with `{PREFIX}alarm` to check their status\n"
+                f"• View your current alarms with `!alarm` to check their status\n"
                 f"• Each alarm has a unique ID number shown when viewing your alarms\n"
                 f"• Alarms are persistent and will trigger even if you go offline"
             ),
@@ -1647,7 +1712,7 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Examples: '{PREFIX}alarm 08:00 Wake up', '{PREFIX}alarm 23:45 Sleep reminder'")
+        embed.set_footer(text=f"Examples: '!alarm 08:00 Wake up', '!alarm 23:45 Sleep reminder'")
     
     # Handle guide for the pomodoro command
     elif command.lower() == "pomodoro":
@@ -1661,8 +1726,8 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Basic Usage",
             value=(
-                f"• `{PREFIX}pomodoro [minutes]` - Start a Pomodoro timer\n"
-                f"  Example: `{PREFIX}pomodoro 25` for a standard 25-minute session\n"
+                f"• `!pomodoro [minutes]` - Start a Pomodoro timer\n"
+                f"  Example: `!pomodoro 25` for a standard 25-minute session\n"
                 f"• Default is 25 minutes if no time is specified\n"
                 f"• Valid time range: 1-120 minutes"
             ),
@@ -1673,7 +1738,7 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="⏱️ Managing Your Timer",
             value=(
-                f"• `{PREFIX}pomodoro cancel` - Cancel your current Pomodoro session\n"
+                f"• `!pomodoro cancel` - Cancel your current Pomodoro session\n"
                 f"• You'll receive a notification when your timer completes\n"
                 f"• You can only have one active Pomodoro session at a time\n"
                 f"• Starting a new session while one is active will show remaining time"
@@ -1687,7 +1752,7 @@ async def guide(ctx, command: str = None):
             value=(
                 "• Each completed Pomodoro session awards 1 point per minute\n"
                 "• For example, a 25-minute session awards 25 points\n"
-                f"• View your current points with `{PREFIX}points`\n"
+                f"• View your current points with `!points`\n"
                 f"• Points reset daily at 11:00 PM when the leaderboard is posted"
             ),
             inline=False
@@ -1718,7 +1783,7 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Examples: '{PREFIX}pomodoro 30' for a 30-minute session, '{PREFIX}pomodoro cancel' to stop")
+        embed.set_footer(text=f"Examples: '!pomodoro 30' for a 30-minute session, '!pomodoro cancel' to stop")
     
     # Handle guide for the settimezone command
     elif command.lower() in ["settimezone", "timezone", "tz"]:
@@ -1732,9 +1797,9 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Basic Usage",
             value=(
-                f"• `{PREFIX}settimezone [timezone]` - Set your time zone\n"
-                f"  Example: `{PREFIX}settimezone US/Eastern` or `{PREFIX}settimezone IST`\n\n"
-                f"• `{PREFIX}settimezone` - View your current time zone setting"
+                f"• `!settimezone [timezone]` - Set your time zone\n"
+                f"  Example: `!settimezone US/Eastern` or `!settimezone IST`\n\n"
+                f"• `!settimezone` - View your current time zone setting"
             ),
             inline=False
         )
@@ -1776,7 +1841,7 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Examples: '{PREFIX}settimezone EST', '{PREFIX}settimezone Europe/Paris'")
+        embed.set_footer(text=f"Examples: '!settimezone EST', '!settimezone Europe/Paris'")
     
     # Handle guide for the points command
     elif command.lower() == "points":
@@ -1790,9 +1855,9 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Basic Usage",
             value=(
-                f"• `{PREFIX}points` - View your current points and session history\n"
-                f"• `{PREFIX}points @user` - View another user's points (if they've earned any)\n"
-                f"• `{PREFIX}leaderboard` - View the current productivity rankings"
+                f"• `!points` - View your current points and session history\n"
+                f"• `!points @user` - View another user's points (if they've earned any)\n"
+                f"• `!leaderboard` - View the current productivity rankings"
             ),
             inline=False
         )
@@ -1836,7 +1901,7 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Related commands: '{PREFIX}pomodoro', '{PREFIX}leaderboard'")
+        embed.set_footer(text=f"Related commands: '!pomodoro', '!leaderboard'")
     
     # Handle guide for the leaderboard command
     elif command.lower() in ["leaderboard", "lb"]:
@@ -1850,8 +1915,8 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Basic Usage",
             value=(
-                f"• `{PREFIX}leaderboard` - View the current day's rankings\n"
-                f"• `{PREFIX}lb` - Shorthand for the leaderboard command"
+                f"• `!leaderboard` - View the current day's rankings\n"
+                f"• `!lb` - Shorthand for the leaderboard command"
             ),
             inline=False
         )
@@ -1894,7 +1959,7 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Related commands: '{PREFIX}points', '{PREFIX}pomodoro'")
+        embed.set_footer(text=f"Related commands: '!points', '!pomodoro'")
     
     # Handle guide for the setsound command
     elif command.lower() in ["setsound", "sound"]:
@@ -1908,9 +1973,9 @@ async def guide(ctx, command: str = None):
         embed.add_field(
             name="📌 Basic Usage",
             value=(
-                f"• `{PREFIX}setsound` - View available sound options and your current setting\n"
-                f"• `{PREFIX}setsound [sound_name]` - Set your preferred notification sound\n"
-                f"  Example: `{PREFIX}setsound alarm` to set the alarm sound"
+                f"• `!setsound` - View available sound options and your current setting\n"
+                f"• `!setsound [sound_name]` - Set your preferred notification sound\n"
+                f"  Example: `!setsound alarm` to set the alarm sound"
             ),
             inline=False
         )
@@ -1942,13 +2007,13 @@ async def guide(ctx, command: str = None):
         )
         
         # Examples footer
-        embed.set_footer(text=f"Examples: '{PREFIX}setsound motivational', '{PREFIX}setsound gentle'")
+        embed.set_footer(text=f"Examples: '!setsound motivational', '!setsound gentle'")
     
     else:
         # Default response for other commands
         embed = discord.Embed(
             title="Command Guide",
-            description=f"Detailed help for `{command}` command is not available yet. Type `{PREFIX}help` to see all available commands.",
+            description=f"Detailed help for `{command}` command is not available yet. Type `!help` to see all available commands.",
             color=discord.Color.blue()
         )
     
@@ -1985,7 +2050,7 @@ async def settimezone(ctx, *, timezone_input: str = None):
         
         embed.add_field(
             name="Usage",
-            value=f"`{PREFIX}settimezone [timezone]` - Example: `{PREFIX}settimezone US/Eastern`"
+            value=f"`!settimezone [timezone]` - Example: `!settimezone US/Eastern`"
         )
         embed.add_field(
             name="Common Options",
@@ -2083,7 +2148,7 @@ async def settimezone(ctx, *, timezone_input: str = None):
             inline=False
         )
         
-        embed.set_footer(text=f"Type {PREFIX}guide settimezone for more help with setting your timezone")
+        embed.set_footer(text=f"Type !guide settimezone for more help with setting your timezone")
         
         await ctx.send(embed=embed)
 
@@ -2120,7 +2185,7 @@ async def setsound(ctx, sound: str = None):
         
         embed.add_field(
             name="How to Change",
-            value=f"Use `{PREFIX}setsound [name]` to change your sound. Example: `{PREFIX}setsound alarm`",
+            value=f"Use `!setsound [name]` to change your sound. Example: `!setsound alarm`",
             inline=False
         )
         
@@ -2169,7 +2234,7 @@ async def setsound(ctx, sound: str = None):
         
         embed.add_field(
             name="More Details",
-            value=f"Use `{PREFIX}setsound` (without any argument) to see detailed sound previews.",
+            value=f"Use `!setsound` (without any argument) to see detailed sound previews.",
             inline=False
         )
         
@@ -2232,7 +2297,7 @@ async def view_points(ctx, user: discord.Member = None):
             # No sessions yet
             embed.add_field(
                 name="No Sessions Today",
-                value=f"Start a Pomodoro session with `{PREFIX}pomodoro [minutes]` to earn points!",
+                value=f"Start a Pomodoro session with `!pomodoro [minutes]` to earn points!",
                 inline=False
             )
     else:
@@ -2241,7 +2306,7 @@ async def view_points(ctx, user: discord.Member = None):
             embed.description = "You haven't earned any productivity points today."
             embed.add_field(
                 name="How to Earn Points",
-                value=f"Use `{PREFIX}pomodoro [minutes]` to start a focus session and earn points (1 point per minute)!",
+                value=f"Use `!pomodoro [minutes]` to start a focus session and earn points (1 point per minute)!",
                 inline=False
             )
         else:
@@ -2333,20 +2398,45 @@ async def view_leaderboard(ctx):
     
     embed.add_field(
         name="How to Earn Points",
-        value=f"Use `{PREFIX}pomodoro [minutes]` to start a focus session and earn points (1 point per minute)!",
+        value=f"Use `!pomodoro [minutes]` to start a focus session and earn points (1 point per minute)!",
         inline=False
     )
     
     await ctx.send(embed=embed)
 
 # Run the bot
+
+# Run the bot
+
+
+# Command to verify that command processing is working
+@bot.command(name="verify_commands")
+async def verify_commands(ctx):
+    """Test if commands are working properly"""
+    await ctx.send(f"✅ Commands are working correctly! Bot is using prefix: '{prefix}'")
+    await ctx.send(f"Try these commands: {prefix}help, {prefix}ping, {prefix}guide")
+
+
+# Command to verify that command handling is working
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(f"Starting Aarohi...")
     print("=" * 60 + "\n")
     try:
-        bot.run(TOKEN, log_handler=None)
+        import json
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+        
+        # Start keep-alive server with error handling
+        try:
+            keep_alive()
+            logger.info("Keep-alive server started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start keep-alive server: {e}")
+            logger.warning("Continuing without keep-alive")
+            
+        # Run the bot
+        bot.run(config['token'])
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        print("\nIf there's an issue with the token, check your config.json file.")
-        input("Press Enter to exit...") 
+        logger.error(f"Error starting bot: {e}")
+        sys.exit(1)
